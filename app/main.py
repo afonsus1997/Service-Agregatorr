@@ -159,9 +159,19 @@ async def api_services():
 # ---------------------------------------------------------------------------
 
 
-def _rewrite_paths(text: str, proxy_base: str) -> str:
+def _rewrite_paths(text: str, proxy_base: str, host_root: str | None = None) -> str:
     """Rewrite absolute-path references to go through the proxy. Skip already-proxied paths."""
     already = re.escape(proxy_base)
+
+    # Absolute self-references to the upstream's own origin. A switch that redirects to
+    # http://192.168.20.2/login.cgi (or links to it) would otherwise escape the proxy
+    # and get X-Frame-blocked / blanked. Rewriting scheme+host to the proxy base turns
+    # those into root-relative paths that stay inside the proxy.
+    if host_root:
+        text = text.replace(host_root, proxy_base)
+        netloc = re.escape(host_root.split("://", 1)[-1])
+        # protocol-relative //192.168.20.2/foo (not already part of a longer host)
+        text = re.sub(rf'(?<![\w.])//{netloc}(?=[/"\'?\s]|$)', proxy_base, text)
 
     # href="/foo", src="/foo", action="/foo" — skip if already starts with proxy_base
     text = re.sub(
@@ -181,6 +191,41 @@ def _rewrite_paths(text: str, proxy_base: str) -> str:
     text = re.sub(
         rf'((?:url|URL|href|location)\s*[=:]\s*["\'])(?!{already})(/(?!/))',
         lambda m: f"{m.group(1)}{proxy_base}/",
+        text,
+    )
+
+    # JS redirects via dotted forms: location.href="/x", .assign("/x"), .replace("/x").
+    # These are the common ways a switch login page forwards to /login.cgi, and the
+    # bare-"location" pattern above misses them.
+    text = re.sub(
+        rf'(\.(?:href|assign|replace)\s*[=(]\s*["\'])(?!{already})(/(?!/))',
+        lambda m: f"{m.group(1)}{proxy_base}/",
+        text,
+    )
+
+    # <meta http-equiv="refresh" content="0; url=/login.cgi"> with a root-relative URL.
+    text = re.sub(
+        rf'(<meta\b[^>]*?\brefresh\b[^>]*?\burl\s*=\s*)(?!{already})(/(?!/))',
+        lambda m: f"{m.group(1)}{proxy_base}/",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Route top/parent NAVIGATION through __hubNav (defined in the injected shim). The
+    # helper no-ops a redirect to the already-loaded page — a frame-detection guard like
+    # IPMI's `if (window != top) top.location.href = "/"`, which would otherwise reload
+    # forever — and navigates the iframe otherwise (a switch forwarding to /login.cgi).
+    # The target URLs are already proxy-prefixed by the rewrites above. Reads and
+    # comparisons (`if (window != top)`, `x = top.location.href`) are NOT navigation, so
+    # they don't match and are left intact.
+    text = re.sub(
+        r"\b(?:window\.)?(?:top|parent)\.location\.(?:replace|assign)\s*\(\s*([^)]*?)\s*\)",
+        lambda m: f"__hubNav({m.group(1)})",
+        text,
+    )
+    text = re.sub(
+        r"\b(?:window\.)?(?:top|parent)\.location(?:\.href)?\s*=(?!=)\s*([^;\n}]+)",
+        lambda m: f"__hubNav({m.group(1).rstrip()})",
         text,
     )
 
@@ -234,6 +279,15 @@ _SHIM_TEMPLATE = (
     "if(typeof o!=='function')return;history[m]=function(s,t,u){"
     "try{return o.call(this,s,t,u);}catch(e){"
     "try{return o.call(this,s,t);}catch(_){return undefined;}}};});"
+    # --- frame-bust handler ---
+    # Rewritten top/parent navigation is routed here. If the target is the page already
+    # loaded (a frame-detection guard redirecting itself, e.g. IPMI's `top.location='/'`),
+    # do nothing so the page renders in-frame instead of reloading forever. Otherwise
+    # navigate the iframe (e.g. a switch forwarding to /login.cgi).
+    "window.__hubNav=function(u){try{if(u==null)return;"
+    "var t=new URL(String(u),location.href).href;"
+    "if(t===location.href)return;location.replace(t);}"
+    "catch(e){try{location.replace(u);}catch(_){}}};"
     # --- absolute-path rewriting ---
     "var PB=__PB__;"
     "function rw(u){try{if(u==null)return u;u=String(u);"
@@ -280,10 +334,15 @@ def _inject_shim(text: str, proxy_base: str) -> str:
     return shim + text
 
 
-def _rewrite_html(content: bytes, service_id: str, proxy_dir: str | None = None) -> bytes:
+def _rewrite_html(
+    content: bytes,
+    service_id: str,
+    proxy_dir: str | None = None,
+    host_root: str | None = None,
+) -> bytes:
     text = content.decode("utf-8", errors="replace")
     proxy_base = f"/proxy/{service_id}"
-    text = _rewrite_paths(text, proxy_base)
+    text = _rewrite_paths(text, proxy_base, host_root)
     if proxy_dir and proxy_dir != proxy_base + "/":
         text = _inject_base(text, proxy_dir)
     text = _inject_shim(text, proxy_base)
@@ -387,7 +446,7 @@ async def proxy(service_id: str, path: str, request: Request):
         else:             # path is already a directory
             final_dir = _fp + "/"
         proxy_dir = f"/proxy/{service_id}{final_dir}"
-        content = _rewrite_html(content, service_id, proxy_dir)
+        content = _rewrite_html(content, service_id, proxy_dir, host_root)
     elif "text/css" in content_type:
         content = _rewrite_css(content, service_id)
 
