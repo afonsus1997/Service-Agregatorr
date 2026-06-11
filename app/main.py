@@ -1,11 +1,15 @@
+import asyncio
+import json
 import os
 import re
+import ssl as ssl_mod
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+import websockets
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -47,9 +51,41 @@ _STRIP_RESP_HEADERS = frozenset(
 _STRIP_REQ_HEADERS = frozenset({"host", "origin", "referer", "content-length"})
 
 
+DEFAULT_CONFIG: dict = {
+    "app": {"title": "Service Hub"},
+    "services": [],
+}
+
+
+def _write_config(config: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as fh:
+        yaml.dump(
+            config,
+            fh,
+            default_flow_style=False,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+
+
 def load_config() -> dict:
-    with open(CONFIG_PATH) as f:
-        return yaml.safe_load(f)
+    """Load the config, initializing it with defaults when missing or empty."""
+    try:
+        with open(CONFIG_PATH) as f:
+            config = yaml.safe_load(f)
+    except FileNotFoundError:
+        config = None
+
+    if not config:
+        config = dict(DEFAULT_CONFIG)
+        try:
+            _write_config(config)
+        except OSError:
+            # Read-only mount or similar — still serve sensible defaults in-memory.
+            pass
+
+    return config
 
 
 def find_service(config: dict, service_id: str) -> dict:
@@ -90,14 +126,7 @@ async def put_config(request: Request):
                 raise HTTPException(400, f"each service needs '{field}'")
 
     try:
-        with open(CONFIG_PATH, "w") as fh:
-            yaml.dump(
-                data,
-                fh,
-                default_flow_style=False,
-                allow_unicode=True,
-                sort_keys=False,
-            )
+        _write_config(data)
     except OSError as exc:
         raise HTTPException(500, f"Cannot write config: {exc}")
 
@@ -181,12 +210,83 @@ def _inject_base(text: str, proxy_dir: str) -> str:
     )
 
 
+# Injected before any of the page's own scripts. Does two jobs:
+#
+# 1. Compat: legacy appliance UIs (managed switches, routers) assign `document.domain`
+#    or call history.pushState/replaceState with their original absolute URL — both
+#    throw "SecurityError: The operation is insecure" once the page is reframed and
+#    served from the proxy origin, halting the rest of their startup script.
+#
+# 2. URL rewriting: SPAs (e.g. TrueNAS) build API and WebSocket URLs dynamically from
+#    window.location — `ws://{host}/api/current`, `fetch('/api/...')` — with no proxy
+#    prefix, so they escape the static HTML rewrite and hit the hub root. We wrap
+#    WebSocket/fetch/XMLHttpRequest to re-add the `/proxy/<id>` prefix to same-host
+#    and root-relative URLs at call time.
+#
+# The whole thing is wrapped so it can never itself throw and break a page that
+# doesn't need it. `__PB__` is replaced with the JSON-encoded proxy base.
+_SHIM_TEMPLATE = (
+    "<script>(function(){try{"
+    # --- document.domain / history compat ---
+    "try{Object.defineProperty(document,'domain',{configurable:true,"
+    "get:function(){return location.hostname},set:function(){}});}catch(e){}"
+    "['pushState','replaceState'].forEach(function(m){var o=history[m];"
+    "if(typeof o!=='function')return;history[m]=function(s,t,u){"
+    "try{return o.call(this,s,t,u);}catch(e){"
+    "try{return o.call(this,s,t);}catch(_){return undefined;}}};});"
+    # --- absolute-path rewriting ---
+    "var PB=__PB__;"
+    "function rw(u){try{if(u==null)return u;u=String(u);"
+    "var m=u.match(/^(https?:|wss?:)?\\/\\/([^\\/?#]+)([\\/?#].*)?$/i);"
+    "if(m){if(m[2]!==location.host)return u;var r=m[3]||'/';"
+    "if(r.indexOf(PB+'/')===0||r===PB)return u;return (m[1]||'')+'//'+m[2]+PB+r;}"
+    "if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){"
+    "if(u.indexOf(PB+'/')===0||u===PB)return u;return PB+u;}"
+    "return u;}catch(e){return u;}}"
+    "var _WS=window.WebSocket;if(_WS){var WS=function(url,protocols){"
+    "return new _WS(rw(url),protocols);};WS.prototype=_WS.prototype;"
+    "try{WS.CONNECTING=_WS.CONNECTING;WS.OPEN=_WS.OPEN;WS.CLOSING=_WS.CLOSING;"
+    "WS.CLOSED=_WS.CLOSED;}catch(e){}window.WebSocket=WS;}"
+    "var _f=window.fetch;if(_f){window.fetch=function(input,init){try{"
+    "if(typeof input==='string')input=rw(input);"
+    "else if(input&&input.url)input=new Request(rw(input.url),input);"
+    "}catch(e){}return _f.call(this,input,init);};}"
+    "var _xo=window.XMLHttpRequest&&XMLHttpRequest.prototype.open;if(_xo){"
+    "XMLHttpRequest.prototype.open=function(method,url){try{url=rw(url);}catch(e){}"
+    "return _xo.apply(this,[method,url].concat([].slice.call(arguments,2)));};}"
+    "}catch(e){}})();</script>"
+)
+
+
+def _build_shim(proxy_base: str) -> str:
+    return _SHIM_TEMPLATE.replace("__PB__", json.dumps(proxy_base))
+
+
+def _inject_shim(text: str, proxy_base: str) -> str:
+    """Insert the compatibility shim as the first script the page runs.
+    Prefers just inside <head>; falls back to after <html ...>, then to the very top
+    (covers quirks-mode / frameset pages that may omit <head>)."""
+    shim = _build_shim(proxy_base)
+    for pattern in (r"(<head\b[^>]*>)", r"(<html\b[^>]*>)"):
+        new_text, n = re.subn(
+            pattern,
+            lambda m: f"{m.group(1)}{shim}",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if n:
+            return new_text
+    return shim + text
+
+
 def _rewrite_html(content: bytes, service_id: str, proxy_dir: str | None = None) -> bytes:
     text = content.decode("utf-8", errors="replace")
     proxy_base = f"/proxy/{service_id}"
     text = _rewrite_paths(text, proxy_base)
     if proxy_dir and proxy_dir != proxy_base + "/":
         text = _inject_base(text, proxy_dir)
+    text = _inject_shim(text, proxy_base)
     return text.encode("utf-8")
 
 
@@ -219,6 +319,12 @@ async def proxy(service_id: str, path: str, request: Request):
     # for every CSS/JS request, causing MIME-type blocks in the browser.
     _svc_last_seg = _parsed.path.rstrip("/").split("/")[-1]
     _svc_is_file = "." in _svc_last_seg and bool(_svc_last_seg)
+
+    # Collapse a leading slash on the captured path. SPAs (Portainer) append "/api"
+    # to a base href that already ends in "/", producing "/proxy/portainer//api/...";
+    # the doubled slash is captured here as a leading "/" and would forward upstream
+    # as "host//api/...", which 404s. The route already owns the slash after the id.
+    path = path.lstrip("/")
 
     if path:
         # Always resolve resource requests from the host root so absolute paths like
@@ -291,3 +397,89 @@ async def proxy(service_id: str, path: str, request: Request):
         status_code=upstream.status_code,
         headers=resp_headers,
     )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket proxy
+# ---------------------------------------------------------------------------
+# SPAs like TrueNAS run entirely over a WebSocket (e.g. /api/current). The client
+# shim rewrites those URLs to /proxy/<id>/..., and this endpoint bridges the browser
+# socket to the upstream device socket, relaying frames in both directions.
+
+
+@app.websocket("/proxy/{service_id}/{path:path}")
+async def proxy_ws(client_ws: WebSocket, service_id: str, path: str):
+    config = load_config()
+    svc = next(
+        (s for s in config.get("services", []) if s.get("id") == service_id),
+        None,
+    )
+    if svc is None:
+        await client_ws.close(code=1008)  # policy violation
+        return
+
+    parsed = urlparse(svc["url"])
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    target = f"{scheme}://{parsed.netloc}/{path.lstrip('/')}"
+    if client_ws.url.query:
+        target = f"{target}?{client_ws.url.query}"
+
+    # Forward the client's offered subprotocols so upstream can pick one.
+    offered = client_ws.headers.get("sec-websocket-protocol")
+    subprotocols = [p.strip() for p in offered.split(",")] if offered else None
+
+    ssl_ctx = None
+    if scheme == "wss":
+        ssl_ctx = ssl_mod.create_default_context()
+        if svc.get("ignore_ssl"):
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl_mod.CERT_NONE
+
+    try:
+        upstream = await websockets.connect(
+            target,
+            subprotocols=subprotocols,
+            ssl=ssl_ctx,
+            open_timeout=15,
+            max_size=None,  # device payloads can exceed the 1 MiB default
+        )
+    except Exception:
+        # Accept then immediately close so the browser sees a clean failure
+        # rather than a handshake reject it can't introspect.
+        await client_ws.accept()
+        await client_ws.close(code=1011)  # internal error
+        return
+
+    await client_ws.accept(subprotocol=upstream.subprotocol)
+
+    async def client_to_upstream():
+        try:
+            while True:
+                msg = await client_ws.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    break
+                if msg.get("text") is not None:
+                    await upstream.send(msg["text"])
+                elif msg.get("bytes") is not None:
+                    await upstream.send(msg["bytes"])
+        except Exception:
+            pass
+        finally:
+            await upstream.close()
+
+    async def upstream_to_client():
+        try:
+            async for message in upstream:
+                if isinstance(message, (bytes, bytearray)):
+                    await client_ws.send_bytes(message)
+                else:
+                    await client_ws.send_text(message)
+        except Exception:
+            pass
+        finally:
+            try:
+                await client_ws.close()
+            except Exception:
+                pass
+
+    await asyncio.gather(client_to_upstream(), upstream_to_client())
