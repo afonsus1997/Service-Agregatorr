@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="{{ config.app.get('theme', 'dark') }}">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ config.app.get('title', 'Service Hub') }}</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚙️</text></svg>">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+  <nav class="sidebar">
+    <div class="sidebar-header">
+      <span class="sidebar-title">{{ config.app.get('title', 'Hub') }}</span>
+    </div>
+
+    <ul class="nav-list">
+      {% for svc in config.get('services', []) %}
+      <li class="nav-item"
+          id="nav-{{ svc.id }}"
+          style="--svc-color: {{ svc.get('color', '#6366f1') }}">
+        <button class="nav-btn" onclick="selectService('{{ svc.id }}')">
+          {% set icon = svc.get('icon', '🔗') %}
+          {% if icon.startswith('mdi:') %}
+          <img class="nav-icon-img nav-icon-mdi" src="{{ mdi_cdn }}/{{ icon[4:] }}.svg" alt="{{ svc.name }}">
+          {% elif is_icon_slug(icon) %}
+          <img class="nav-icon-img" src="{{ icon_cdn }}/{{ icon }}.svg" alt="{{ svc.name }}">
+          {% elif icon.startswith('http') or icon.startswith('/') %}
+          <img class="nav-icon-img" src="{{ icon }}" alt="{{ svc.name }}">
+          {% else %}
+          <span class="nav-icon">{{ icon }}</span>
+          {% endif %}
+          <span class="nav-label">{{ svc.name }}</span>
+        </button>
+      </li>
+      {% endfor %}
+    </ul>
+
+    <div class="sidebar-footer">
+      <div class="footer-actions">
+        <button class="footer-btn" id="btn-refresh" onclick="refreshActive()"
+                title="Refresh current tab" disabled>
+          <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24"
+               fill="none" stroke="currentColor" stroke-width="2.2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/>
+            <path d="M21 3v5h-5"/>
+          </svg>
+          Refresh
+        </button>
+        <button class="footer-btn" id="btn-load-all" onclick="loadAll()"
+                title="Preload all tabs">
+          <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24"
+               fill="none" stroke="currentColor" stroke-width="2.2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+            <rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+          </svg>
+          Load All
+        </button>
+      </div>
+      <div class="nav-item" id="nav-settings" style="--svc-color: #6366f1">
+        <button class="nav-btn" onclick="openConfig()">
+          <span class="nav-icon">⚙️</span>
+          <span class="nav-label">Settings</span>
+        </button>
+      </div>
+    </div>
+  </nav>
+
+  <main class="content">
+    <div class="welcome" id="welcome">
+      <div class="welcome-inner">
+        <div class="welcome-logo">⚙️</div>
+        <h1>{{ config.app.get('title', 'Service Hub') }}</h1>
+        <p>Pick a service from the sidebar</p>
+      </div>
+    </div>
+
+    {% for svc in config.get('services', []) %}
+    <iframe
+      class="service-frame"
+      id="frame-{{ svc.id }}"
+      data-src="{{ '/proxy/' + svc.id + '/' if svc.get('proxy') else svc.url }}"
+      allow="fullscreen"
+      sandbox="allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-downloads"
+      title="{{ svc.name }}">
+    </iframe>
+    {% endfor %}
+
+    <div class="config-panel" id="config-panel"></div>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

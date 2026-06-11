@@ -1,0 +1,11 @@
+services:
+  service-hub:
+    image: afonsus1997/service-agregatorr:latest
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yml:/config/config.yml
+    restart: unless-stopped
+    # Allows reaching LAN IPs from inside the container on Linux
+    network_mode: host
