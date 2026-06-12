@@ -233,19 +233,28 @@ def _rewrite_paths(text: str, proxy_base: str, host_root: str | None = None) -> 
 
 
 def _inject_base(text: str, proxy_dir: str) -> str:
-    """Set <base href> to proxy_dir so relative URLs resolve correctly.
-    Replaces an existing <base href=...> if present; otherwise injects one after <head>.
-    Pi-hole and similar apps set <base href="/admin/login.php/"> (the PHP self-path with
-    trailing slash), which makes relative asset paths resolve to wrong proxy sub-paths."""
-    replaced, n = re.subn(
-        r'(<base\b[^>]*?\bhref\s*=\s*)["\'][^"\']*["\']',
-        lambda m: f'{m.group(1)}"{proxy_dir}"',
-        text,
-        count=1,
-        flags=re.IGNORECASE,
+    """Set <base href> so relative URLs resolve correctly under the proxy.
+
+    If the page has no <base>, inject proxy_dir (the page's directory). If it has one,
+    only OVERRIDE it when it points at a file — e.g. Pi-hole's bogus self-path
+    <base href="/admin/login.php/">. A real directory base (e.g. UniFi's Angular
+    <base href="/manage/">, already proxy-prefixed by _rewrite_paths) is the app's
+    intended base and must be kept; overriding it with the page directory makes relative
+    assets resolve under the page path (.../account/login/angular/... -> 404 HTML)."""
+    existing = re.search(
+        r'<base\b[^>]*?\bhref\s*=\s*["\']([^"\']*)["\']', text, re.IGNORECASE
     )
-    if n:
-        return replaced
+    if existing:
+        last = existing.group(1).strip().rstrip("/").split("/")[-1]
+        if "." not in last:
+            return text  # real directory base — keep it
+        return re.sub(
+            r'(<base\b[^>]*?\bhref\s*=\s*)["\'][^"\']*["\']',
+            lambda m: f'{m.group(1)}"{proxy_dir}"',
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
     return re.sub(
         r'(<head\b[^>]*>)',
         lambda m: f'{m.group(1)}<base href="{proxy_dir}">',
@@ -324,6 +333,23 @@ _SHIM_TEMPLATE = (
     "var _xo=window.XMLHttpRequest&&XMLHttpRequest.prototype.open;if(_xo){"
     "XMLHttpRequest.prototype.open=function(method,url){try{url=rw(url);}catch(e){}"
     "return _xo.apply(this,[method,url].concat([].slice.call(arguments,2)));};}"
+    # --- dynamically-set element src/href ---
+    # SPAs (UniFi index.js) inject <script src="/manage/.../initial.js"> with absolute
+    # paths that ignore <base> and the import map, hitting the hub root -> 404 -> blank.
+    # Patch the property setters and setAttribute so JS-assigned URLs get proxy-prefixed.
+    # The HTML parser sets attributes internally (not via these), so static tags that
+    # resolve against <base> are unaffected — only JS-driven assignments are rewritten.
+    "function _pp(proto,prop){try{if(!proto)return;"
+    "var d=Object.getOwnPropertyDescriptor(proto,prop);if(d&&d.set&&d.get){"
+    "Object.defineProperty(proto,prop,{configurable:true,enumerable:d.enumerable,"
+    "get:function(){return d.get.call(this);},"
+    "set:function(v){try{v=rw(v);}catch(e){}return d.set.call(this,v);}});}}catch(e){}}"
+    "_pp(window.HTMLScriptElement&&HTMLScriptElement.prototype,'src');"
+    "_pp(window.HTMLLinkElement&&HTMLLinkElement.prototype,'href');"
+    "_pp(window.HTMLImageElement&&HTMLImageElement.prototype,'src');"
+    "try{var _sa=Element.prototype.setAttribute;"
+    "Element.prototype.setAttribute=function(n,v){try{if(n&&(n.toLowerCase()==='src'"
+    "||n.toLowerCase()==='href'))v=rw(v);}catch(e){}return _sa.call(this,n,v);};}catch(e){}"
     "}catch(e){}})();</script>"
 )
 
@@ -654,6 +680,14 @@ async def proxy(service_id: str, path: str, request: Request):
             raw = _rewrite_html(raw, service_id, proxy_dir, host_root)
         else:
             raw = _rewrite_css(raw, service_id)
+        # Rewritten HTML/CSS must not be cached by the browser: the rewrite (base href,
+        # injected shims, path prefixing) changes across proxy updates, and a stale copy
+        # gives broken asset paths that survive rebuilds (and hard reloads, for iframes).
+        # Drop validators too so the browser can't revalidate to a 304 of the old body.
+        for _h in [k for k in resp_headers if k.lower() in
+                   ("etag", "last-modified", "expires", "cache-control", "pragma")]:
+            del resp_headers[_h]
+        resp_headers["cache-control"] = "no-store"
         response = Response(
             content=raw,
             status_code=upstream.status_code,

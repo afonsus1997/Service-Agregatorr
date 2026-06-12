@@ -98,6 +98,16 @@ let activeId = null;
 let configOpen = false;
 const loaded = new Set();
 
+// Append a unique cache-buster to the iframe's entry URL. The proxied HTML is rewritten
+// (base href, injected shims) and changes across proxy updates; without this, browsers
+// serve a stale cached document in the iframe — and a hard reload doesn't evict iframe
+// caches. Only the entry document carries it; the app's own assets/API calls don't.
+function frameSrc(frame) {
+  const url = frame.dataset.src;
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}_cb=${Date.now()}`;
+}
+
 function selectService(id) {
   if (configOpen) closeConfig();
 
@@ -111,7 +121,7 @@ function selectService(id) {
   if (!frame) return;
 
   if (!loaded.has(id)) {
-    frame.src = frame.dataset.src;
+    frame.src = frameSrc(frame);
     loaded.add(id);
   }
 
@@ -134,7 +144,7 @@ function selectService(id) {
 function refreshActive() {
   if (!activeId) return;
   const frame = document.getElementById(`frame-${activeId}`);
-  if (frame) frame.src = frame.src;
+  if (frame) frame.src = frameSrc(frame);
 }
 
 function loadAll() {
@@ -142,7 +152,7 @@ function loadAll() {
   document.querySelectorAll('.service-frame').forEach(frame => {
     const id = frame.id.replace('frame-', '');
     if (!loaded.has(id)) {
-      frame.src = frame.dataset.src;
+      frame.src = frameSrc(frame);
       loaded.add(id);
     }
   });
