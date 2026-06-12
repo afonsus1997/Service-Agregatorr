@@ -241,6 +241,7 @@ function serviceCardHTML(svc) {
   const color     = svc.color      || '#6366f1';
   const proxy     = svc.proxy      ? 'checked' : '';
   const ignoreSsl = svc.ignore_ssl ? 'checked' : '';
+  const newTab    = svc.new_tab    ? 'checked' : '';
 
   return `
     <div class="svc-card" data-orig-id="${id}">
@@ -271,6 +272,10 @@ function serviceCardHTML(svc) {
         <label class="toggle-label">
           <input class="f-ssl" type="checkbox" ${ignoreSsl}>
           Ignore SSL
+        </label>
+        <label class="toggle-label" title="Open directly in a new browser tab instead of embedding (for apps that resist proxying)">
+          <input class="f-newtab" type="checkbox" ${newTab}>
+          New tab
         </label>
         ${id ? `<span class="svc-id-hint">id: ${id}</span>` : ''}
       </div>
@@ -321,6 +326,7 @@ async function saveConfig() {
       color:      card.querySelector('.f-color').value,
       proxy:      card.querySelector('.f-proxy').checked,
       ignore_ssl: card.querySelector('.f-ssl').checked,
+      new_tab:    card.querySelector('.f-newtab').checked,
     });
   });
 

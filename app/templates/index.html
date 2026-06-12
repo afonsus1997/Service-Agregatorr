@@ -19,7 +19,8 @@
       <li class="nav-item"
           id="nav-{{ svc.id }}"
           style="--svc-color: {{ svc.get('color', '#6366f1') }}">
-        <button class="nav-btn" onclick="selectService('{{ svc.id }}')">
+        <button class="nav-btn"
+          {% if svc.get('new_tab') %}onclick="window.open('{{ svc.url }}', '_blank', 'noopener')"{% else %}onclick="selectService('{{ svc.id }}')"{% endif %}>
           {% set icon = svc.get('icon', '🔗') %}
           {% if icon.startswith('mdi:') %}
           <img class="nav-icon-img nav-icon-mdi" src="{{ mdi_cdn }}/{{ icon[4:] }}.svg" alt="{{ svc.name }}">
@@ -31,6 +32,7 @@
           <span class="nav-icon">{{ icon }}</span>
           {% endif %}
           <span class="nav-label">{{ svc.name }}</span>
+          {% if svc.get('new_tab') %}<span class="nav-ext" title="Opens in a new tab">↗</span>{% endif %}
         </button>
       </li>
       {% endfor %}
@@ -78,6 +80,7 @@
     </div>
 
     {% for svc in config.get('services', []) %}
+    {% if not svc.get('new_tab') %}
     <iframe
       class="service-frame"
       id="frame-{{ svc.id }}"
@@ -86,6 +89,7 @@
       sandbox="allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-downloads"
       title="{{ svc.name }}">
     </iframe>
+    {% endif %}
     {% endfor %}
 
     <div class="config-panel" id="config-panel"></div>

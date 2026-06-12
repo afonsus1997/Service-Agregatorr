@@ -126,6 +126,12 @@ body {
   text-overflow: ellipsis;
 }
 
+.nav-ext {
+  flex: 0 0 auto;
+  opacity: 0.5;
+  font-size: 0.85em;
+}
+
 /* ── Content ───────────────────────────────────────────────── */
 .content {
   flex: 1;
