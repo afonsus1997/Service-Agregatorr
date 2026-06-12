@@ -326,9 +326,20 @@ _SHIM_TEMPLATE = (
     "return new _ES(rw(url),cfg);};ES.prototype=_ES.prototype;"
     "try{ES.CONNECTING=_ES.CONNECTING;ES.OPEN=_ES.OPEN;ES.CLOSED=_ES.CLOSED;}"
     "catch(e){}window.EventSource=ES;}"
+    # String URL: rewrite and keep init (the body lives in init, untouched). Request
+    # object whose URL needs rewriting: new Request(url, oldReq) silently DROPS the body
+    # (a stream body needs duplex and still doesn't carry reliably), which empties POST
+    # bodies — UniFi login then sees no credentials. So buffer the body via clone() into
+    # an ArrayBuffer and rebuild the Request with it.
     "var _f=window.fetch;if(_f){window.fetch=function(input,init){try{"
-    "if(typeof input==='string')input=rw(input);"
-    "else if(input&&input.url)input=new Request(rw(input.url),input);"
+    "if(typeof input==='string'){return _f.call(this,rw(input),init);}"
+    "if(input&&typeof input==='object'&&input.url){var nu=rw(input.url);"
+    "if(nu===input.url)return _f.call(this,input,init);var s=input;"
+    "return s.clone().arrayBuffer().then(function(buf){"
+    "var ri={method:s.method,headers:s.headers,credentials:s.credentials,"
+    "cache:s.cache,redirect:s.redirect,keepalive:s.keepalive,signal:s.signal};"
+    "if(s.method!=='GET'&&s.method!=='HEAD'&&buf&&buf.byteLength)ri.body=buf;"
+    "return _f.call(window,nu,ri);});}"
     "}catch(e){}return _f.call(this,input,init);};}"
     "var _xo=window.XMLHttpRequest&&XMLHttpRequest.prototype.open;if(_xo){"
     "XMLHttpRequest.prototype.open=function(method,url){try{url=rw(url);}catch(e){}"
